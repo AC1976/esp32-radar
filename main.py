@@ -1,0 +1,208 @@
+# main.py - ADS-B "sweeping radar" for ESP32-C6 + MicroPython (v1.24 or newer)
+#
+# Display : 240x240 SPI TFT (GC9A01 round is ideal, ST7789 square also works)
+# Driver  : any pure-Python driver with blit_buffer(buf, x, y, w, h), e.g.
+#           russhughes/gc9a01py or russhughes/st7789py_mpy (copy the .py to the board)
+# Data    : airplanes.live public API (no key; keep to <= 1 request/second)
+#
+# How it works: everything is drawn into ONE RGB565 framebuffer in RAM using the
+# built-in (C-speed) framebuf module, then the whole frame is pushed to the
+# display in a single SPI transfer. A background thread polls the API.
+
+import gc, math, time, _thread
+import network, framebuf, requests
+from array import array
+from machine import Pin, SPI
+
+# ------------------------------------------------------------------ config
+from secrets import WIFI_SSID, WIFI_PASS   # secrets.py lives on the board, not in git
+HOME_LAT    = 52.3086          # your position (decimal degrees)
+HOME_LON    = 4.7639
+RANGE_NM    = 25               # outer ring radius in nautical miles
+MIN_ALT_FT  = 500              # ignore aircraft on the ground or below this altitude
+FETCH_S     = 8                # seconds between API calls
+SWEEP_S     = 4.0              # seconds per full beam rotation
+TRAIL_DEG   = 60               # length of the fading afterglow behind the beam
+TRAIL_STEPS = 15               # number of wedges the afterglow is built from
+API_URL     = "https://api.airplanes.live/v2/point/{:.4f}/{:.4f}/{}"
+
+W, H   = 240, 240
+CX, CY = W // 2, H // 2
+R      = min(W, H) // 2 - 2
+
+# ------------------------------------------------------------------ framebuffer
+# Allocate first, before Wi-Fi/TLS/JSON fragment the heap (needs 115 KB contiguous).
+buf = bytearray(W * H * 2)
+fb  = framebuf.FrameBuffer(buf, W, H, framebuf.RGB565)
+
+# ------------------------------------------------------------------ display
+# Example pins - change to your wiring. On the C6 avoid strapping pins 4, 5, 8, 9, 15
+# and the USB pins 12/13. GC9A01 uses SPI mode 0; many CS-less ST7789 modules need
+# polarity=1, phase=1. Try 60-80 MHz once it works at 40 MHz.
+spi = SPI(1, baudrate=40_000_000, polarity=0, phase=0, sck=Pin(6), mosi=Pin(7))
+
+import gc9a01py as drv         # use the driver file's actual module name
+tft = drv.GC9A01(spi, dc=Pin(19, Pin.OUT), cs=Pin(18, Pin.OUT),
+                 reset=Pin(20, Pin.OUT), backlight=Pin(21, Pin.OUT), rotation=0)
+# ST7789 alternative (check your driver's README for the exact constructor):
+# import st7789py as drv
+# tft = drv.ST7789(spi, 240, 240, reset=Pin(20, Pin.OUT), dc=Pin(19, Pin.OUT),
+#                  cs=Pin(18, Pin.OUT), backlight=Pin(21, Pin.OUT), rotation=0)
+
+# ------------------------------------------------------------------ colours
+def rgb(r, g, b):
+    """RGB888 -> RGB565, byte-swapped: framebuf stores little-endian,
+    SPI panels expect big-endian. If red/blue look swapped, your panel is BGR."""
+    c = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+    return ((c & 0xFF) << 8) | (c >> 8)
+
+BLACK = 0
+GRID  = rgb(0, 70, 0)
+TEXT  = rgb(0, 150, 0)
+BEAM  = rgb(170, 255, 170)
+
+# Afterglow: brightest right behind the beam, quadratic fall-off
+TRAIL = [rgb(0, int(190 * (1 - i / TRAIL_STEPS) ** 2) + 12, 0) for i in range(TRAIL_STEPS)]
+
+# Blip brightness levels ("phosphor decay"); small floor so contacts never vanish
+LEVELS = 16
+BLIP = []
+for i in range(LEVELS):
+    f = 0.15 + 0.85 * (i / (LEVELS - 1)) ** 1.5
+    BLIP.append(rgb(int(110 * f), int(255 * f), int(110 * f)))
+
+# ------------------------------------------------------------------ geometry tables
+# Compass convention: 0 deg = north (up), clockwise. Precomputed rim offsets per degree.
+D2R = math.pi / 180
+EX = array('h', [int(R * math.sin(a * D2R)) for a in range(360)])
+EY = array('h', [int(-R * math.cos(a * D2R)) for a in range(360)])
+
+STEP = TRAIL_DEG // TRAIL_STEPS
+_tri = array('h', [0, 0, 0, 0, 0, 0])      # reused triangle: centre + two rim points
+
+def wedge(a0, a1, c):
+    a0 %= 360
+    a1 %= 360
+    _tri[2] = EX[a0]; _tri[3] = EY[a0]
+    _tri[4] = EX[a1]; _tri[5] = EY[a1]
+    fb.poly(CX, CY, _tri, c, True)          # filled triangle, coords relative to centre
+
+def draw_trail(a):
+    for i in range(TRAIL_STEPS):
+        hi = a - i * STEP
+        wedge(hi - STEP, hi, TRAIL[i])
+
+def draw_grid():
+    for k in (1, 2, 3):
+        r = R * k // 3
+        fb.ellipse(CX, CY, r, r, GRID)
+    fb.hline(CX - R, CY, 2 * R, GRID)
+    fb.vline(CX, CY - R, 2 * R, GRID)
+    fb.text("N", CX - 3, CY - R + 4, TEXT)
+    fb.text("%dNM" % RANGE_NM, CX + 4, CY + R - 14, TEXT)
+
+# ------------------------------------------------------------------ aircraft data
+# Each entry: (east_nm, north_nm, v_east, v_north [nm per ms], t_ms, label)
+planes = []
+
+def fetch_once():
+    r = requests.get(API_URL.format(HOME_LAT, HOME_LON, RANGE_NM),
+                     headers={"User-Agent": "esp32c6-radar"})
+    try:
+        data = r.json()
+    finally:
+        r.close()
+    now = time.ticks_ms()
+    k = math.cos(HOME_LAT * D2R)            # shrink longitude degrees with latitude
+    out = []
+    for ac in data.get("ac", ()):
+        lat = ac.get("lat"); lon = ac.get("lon")
+        if lat is None or lon is None:
+            continue
+        # alt_baro is feet, or the string "ground"; fall back to GPS altitude
+        alt = ac.get("alt_baro")
+        if alt == "ground":
+            continue
+        if not isinstance(alt, (int, float)):
+            alt = ac.get("alt_geom")
+        if not isinstance(alt, (int, float)) or alt < MIN_ALT_FT:
+            continue
+        e = (lon - HOME_LON) * 60 * k       # 1 deg latitude = 60 nm
+        n = (lat - HOME_LAT) * 60
+        v = (ac.get("gs") or 0) / 3_600_000 # knots -> nm per ms
+        trk = (ac.get("track") or 0) * D2R
+        label = (ac.get("flight") or ac.get("hex") or "").strip()
+        out.append((e, n, v * math.sin(trk), v * math.cos(trk), now, label))
+    return out
+
+def fetch_loop():
+    global planes
+    while True:
+        try:
+            planes = fetch_once()           # rebinding a name is atomic: no lock needed
+        except Exception as e:
+            print("fetch failed:", e)
+        gc.collect()
+        time.sleep(FETCH_S)
+
+SCALE = R / RANGE_NM
+RMAX2 = RANGE_NM * RANGE_NM
+
+def draw_planes(angle, now):
+    for e0, n0, ve, vn, t0, label in planes:
+        dt = time.ticks_diff(now, t0)
+        e = e0 + ve * dt                    # dead-reckon between API updates
+        n = n0 + vn * dt
+        if e * e + n * n > RMAX2:
+            continue
+        brg = math.atan2(e, n) / D2R        # bearing from home, 0 = north
+        lag = (angle - brg) % 360           # degrees since the beam last swept it
+        c = BLIP[int((1 - lag / 360) * (LEVELS - 1))]
+        x = CX + int(e * SCALE)
+        y = CY - int(n * SCALE)
+        fb.fill_rect(x - 1, y - 1, 3, 3, c)
+        if lag < 180:                       # label only while still "glowing"
+            fb.text(label, x + 4, y - 3, c)
+
+# ------------------------------------------------------------------ main
+def wifi():
+    sta = network.WLAN(network.STA_IF)
+    sta.active(True)
+    if not sta.isconnected():
+        sta.connect(WIFI_SSID, WIFI_PASS)
+        for _ in range(150):
+            if sta.isconnected():
+                break
+            time.sleep_ms(100)
+    print("wifi:", sta.isconnected(), sta.ifconfig())
+
+def main():
+    fb.fill(BLACK)
+    fb.text("connecting...", CX - 52, CY - 4, TEXT)
+    tft.blit_buffer(buf, 0, 0, W, H)
+    wifi()
+
+    _thread.stack_size(16 * 1024)           # TLS + JSON need a bigger stack
+    _thread.start_new_thread(fetch_loop, ())
+
+    deg_per_ms = 360 / (SWEEP_S * 1000)
+    angle = 0.0
+    last = time.ticks_ms()
+    while True:
+        now = time.ticks_ms()
+        # advance by elapsed time, so sweep speed is constant whatever the fps
+        angle = (angle + time.ticks_diff(now, last) * deg_per_ms) % 360
+        last = now
+        a = int(angle)
+
+        fb.fill(BLACK)
+        draw_trail(a)                       # 1. afterglow wedges
+        draw_grid()                         # 2. rings on top of the glow
+        fb.line(CX, CY, CX + EX[a], CY + EY[a], BEAM)   # 3. the beam itself
+        draw_planes(angle, now)             # 4. blips with decay
+        fb.fill_rect(CX - 1, CY - 1, 3, 3, BEAM)        # home marker
+
+        tft.blit_buffer(buf, 0, 0, W, H)    # one SPI burst per frame
+        time.sleep_ms(1)                    # let the fetch thread get the GIL
+
+main()
