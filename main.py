@@ -16,6 +16,15 @@ from machine import Pin, SPI
 
 # ------------------------------------------------------------------ config
 from secrets import WIFI_SSID, WIFI_PASS   # secrets.py lives on the board, not in git
+
+# Which board? Pin maps match the wiring diagrams in this repo.
+BOARD = "XIAO_C6"              # "XIAO_C6" (Seeed XIAO ESP32C6) or "DEVKITC" (ESP32-C6-DevKitC-1)
+PINS = {
+    #             SPI clock/data    display control          LED strip
+    "XIAO_C6": dict(sck=18, mosi=20, res=22, dc=21, cs=2,  blk=1,  led=0),   # D10 D9 D4 D3 D2 D1 D0
+    "DEVKITC": dict(sck=6,  mosi=7,  res=18, dc=19, cs=20, blk=21, led=22),
+}[BOARD]
+
 HOME_LAT    = 52.3086          # your position (decimal degrees)
 HOME_LON    = 4.7639
 RANGE_NM    = 25               # outer ring radius in nautical miles
@@ -27,7 +36,7 @@ TRAIL_STEPS = 15               # number of wedges the afterglow is built from
 API_URL     = "https://api.airplanes.live/v2/point/{:.4f}/{:.4f}/{}"
 
 # LED proximity bar (WS2812 / NeoPixel strip)
-LED_PIN        = 22            # data-in of the strip
+LED_PIN        = PINS["led"]   # data-in of the strip
 LED_N          = 10            # number of LEDs
 LED_RANGE_NM   = 20            # bar shows inbound traffic within this distance (20/10 = 2 nm per LED)
 MIN_CLOSING_KT = 30            # must be closing at least this fast to count as "approaching"
@@ -44,18 +53,27 @@ buf = bytearray(W * H * 2)
 fb  = framebuf.FrameBuffer(buf, W, H, framebuf.RGB565)
 
 # ------------------------------------------------------------------ display
-# Example pins - change to your wiring. On the C6 avoid strapping pins 4, 5, 8, 9, 15
-# and the USB pins 12/13. GC9A01 uses SPI mode 0; many CS-less ST7789 modules need
-# polarity=1, phase=1. Try 60-80 MHz once it works at 40 MHz.
-spi = SPI(1, baudrate=40_000_000, polarity=0, phase=0, sck=Pin(6), mosi=Pin(7))
+# Pins come from PINS above (see the wiring SVGs). The C6 can route SPI to any GPIO;
+# on the DevKitC, GPIO 6/7 are the native SPI pins and run best at high clocks. On the
+# XIAO those pins aren't on the headers, so if 60-80 MHz gives garbage, drop back to 40.
+# GC9A01 uses SPI mode 0; many CS-less ST7789 modules need polarity=1, phase=1.
+spi = SPI(1, baudrate=40_000_000, polarity=0, phase=0,
+          sck=Pin(PINS["sck"]), mosi=Pin(PINS["mosi"]))
 
 import gc9a01py as drv         # use the driver file's actual module name
-tft = drv.GC9A01(spi, dc=Pin(19, Pin.OUT), cs=Pin(18, Pin.OUT),
-                 reset=Pin(20, Pin.OUT), backlight=Pin(21, Pin.OUT), rotation=0)
+tft = drv.GC9A01(spi, dc=Pin(PINS["dc"], Pin.OUT), cs=Pin(PINS["cs"], Pin.OUT),
+                 reset=Pin(PINS["res"], Pin.OUT), backlight=Pin(PINS["blk"], Pin.OUT),
+                 rotation=0)
 # ST7789 alternative (check your driver's README for the exact constructor):
 # import st7789py as drv
-# tft = drv.ST7789(spi, 240, 240, reset=Pin(20, Pin.OUT), dc=Pin(19, Pin.OUT),
-#                  cs=Pin(18, Pin.OUT), backlight=Pin(21, Pin.OUT), rotation=0)
+# tft = drv.ST7789(spi, 240, 240, reset=Pin(PINS["res"], Pin.OUT), dc=Pin(PINS["dc"], Pin.OUT),
+#                  cs=Pin(PINS["cs"], Pin.OUT), backlight=Pin(PINS["blk"], Pin.OUT), rotation=0)
+
+if BOARD == "XIAO_C6":
+    # XIAO RF switch: GPIO3 low enables it, GPIO14 selects the antenna
+    # (0 = on-board ceramic antenna, 1 = external U.FL antenna).
+    Pin(3, Pin.OUT, value=0)
+    Pin(14, Pin.OUT, value=0)
 
 # ------------------------------------------------------------------ LED strip
 import neopixel
