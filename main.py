@@ -26,6 +26,14 @@ TRAIL_DEG   = 60               # length of the fading afterglow behind the beam
 TRAIL_STEPS = 15               # number of wedges the afterglow is built from
 API_URL     = "https://api.airplanes.live/v2/point/{:.4f}/{:.4f}/{}"
 
+# LED proximity bar (WS2812 / NeoPixel strip)
+LED_PIN        = 22            # data-in of the strip
+LED_N          = 10            # number of LEDs
+LED_RANGE_NM   = 20            # bar shows inbound traffic within this distance (20/10 = 2 nm per LED)
+MIN_CLOSING_KT = 30            # must be closing at least this fast to count as "approaching"
+LED_BRIGHT     = 40            # 0-255; keep low (10 LEDs at full white draw ~600 mA)
+LED_SPEED      = 25            # bar animation speed, LEDs per second
+
 W, H   = 240, 240
 CX, CY = W // 2, H // 2
 R      = min(W, H) // 2 - 2
@@ -48,6 +56,15 @@ tft = drv.GC9A01(spi, dc=Pin(19, Pin.OUT), cs=Pin(18, Pin.OUT),
 # import st7789py as drv
 # tft = drv.ST7789(spi, 240, 240, reset=Pin(20, Pin.OUT), dc=Pin(19, Pin.OUT),
 #                  cs=Pin(18, Pin.OUT), backlight=Pin(21, Pin.OUT), rotation=0)
+
+# ------------------------------------------------------------------ LED strip
+import neopixel
+np = neopixel.NeoPixel(Pin(LED_PIN, Pin.OUT), LED_N)
+# Gradient along the strip: green at the "far" end -> red at the "close" end
+LED_COL = []
+for i in range(LED_N):
+    f = i / (LED_N - 1)
+    LED_COL.append((int(LED_BRIGHT * f), int(LED_BRIGHT * (1 - f)), 0))
 
 # ------------------------------------------------------------------ colours
 def rgb(r, g, b):
@@ -164,6 +181,53 @@ def draw_planes(angle, now):
         if lag < 180:                       # label only while still "glowing"
             fb.text(label, x + 4, y - 3, c)
 
+# ------------------------------------------------------------------ LED proximity bar
+KT_PER_NM_MS = 3_600_000          # (nm per ms) -> knots
+
+def nearest_inbound(now):
+    """Distance (nm) of the closest aircraft inside LED_RANGE_NM that is closing
+    on home, or None if there isn't one."""
+    best = None
+    for e0, n0, ve, vn, t0, label in planes:
+        dt = time.ticks_diff(now, t0)
+        e = e0 + ve * dt
+        n = n0 + vn * dt
+        d = math.sqrt(e * e + n * n)
+        if d > LED_RANGE_NM or d < 0.01:
+            continue
+        # closing speed = -(radial velocity); positive means getting closer
+        closing_kt = -(e * ve + n * vn) / d * KT_PER_NM_MS
+        if closing_kt < MIN_CLOSING_KT:
+            continue
+        if best is None or d < best:
+            best = d
+    return best
+
+def led_target(d):
+    """Number of LEDs to light: 1 at the edge of LED_RANGE_NM, all of them overhead."""
+    if d is None:
+        return 0
+    return min(LED_N, int((LED_RANGE_NM - d) / LED_RANGE_NM * LED_N) + 1)
+
+led_level = 0.0                   # animated (fractional) bar height
+led_goal  = 0                     # where the bar is heading
+led_shown = -1                    # what is currently on the strip
+
+def led_update(dt_ms):
+    """Move the bar one animation step toward led_goal; write only on change."""
+    global led_level, led_shown
+    step = LED_SPEED * dt_ms / 1000
+    if led_level < led_goal:
+        led_level = min(led_goal, led_level + step)
+    elif led_level > led_goal:
+        led_level = max(led_goal, led_level - step)
+    lit = int(led_level + 0.5)
+    if lit != led_shown:
+        for i in range(LED_N):
+            np[i] = LED_COL[i] if i < lit else (0, 0, 0)
+        np.write()
+        led_shown = lit
+
 # ------------------------------------------------------------------ main
 def wifi():
     sta = network.WLAN(network.STA_IF)
@@ -177,6 +241,9 @@ def wifi():
     print("wifi:", sta.isconnected(), sta.ifconfig())
 
 def main():
+    global led_goal
+    np.fill((0, 0, 0))
+    np.write()
     fb.fill(BLACK)
     fb.text("connecting...", CX - 52, CY - 4, TEXT)
     tft.blit_buffer(buf, 0, 0, W, H)
@@ -190,10 +257,16 @@ def main():
     last = time.ticks_ms()
     while True:
         now = time.ticks_ms()
-        # advance by elapsed time, so sweep speed is constant whatever the fps
-        angle = (angle + time.ticks_diff(now, last) * deg_per_ms) % 360
+        dt = time.ticks_diff(now, last)
         last = now
+        # advance by elapsed time, so sweep speed is constant whatever the fps
+        prev = angle
+        angle = (angle + dt * deg_per_ms) % 360
         a = int(angle)
+
+        if angle < prev:                    # beam just passed north: once per sweep
+            led_goal = led_target(nearest_inbound(now))
+        led_update(dt)
 
         fb.fill(BLACK)
         draw_trail(a)                       # 1. afterglow wedges
