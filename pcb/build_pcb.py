@@ -79,7 +79,7 @@ CAP_M = ("Capacitor_THT", "C_Disc_D5.0mm_W2.5mm_P5.00mm")
 place(*CAP_S, "C1", -27.94, -3.2, value="100nF (display A)"); connect("C1", {1: "GND", 2: "+3V3"})
 place(*CAP_S, "C2", 12.7, -3.2, value="100nF (display B)"); connect("C2", {1: "GND", 2: "+3V3"})
 place(*CAP_S, "C3", 15.5, 56.0, 90, value="100nF (74AHCT125)"); connect("C3", {1: "+5V", 2: "GND"})
-place(*CAP_M, "C4", 29.5, 66.4, value="10uF ceramic (3V3)"); connect("C4", {1: "+3V3", 2: "GND"})
+place(*CAP_M, "C4", 15.5, 66.0, 90, value="10uF ceramic (3V3)"); connect("C4", {1: "+3V3", 2: "GND"})
 place("Capacitor_THT", "CP_Radial_D10.0mm_P5.00mm", "C5", -26.0, 52.0, back=True,
       value="1000uF (optional, back)"); connect("C5", {1: "+3V3", 2: "GND"})
 for i, (hx, hy) in enumerate([(-39.9, -6.0), (38.2, -6.0), (-39.9, 66.5), (39.0, 67.6)]):
@@ -278,8 +278,12 @@ def text(s, x, y, size=1.0, rot=0, layer=pcbnew.F_SilkS):
 for k, nm in enumerate(DISP):
     text(nm, -DX - 8.89 + 2.54 * k, -6.9, 0.9, 90)
     text(nm if nm != "CS1" else "CS", DX - 8.89 + 2.54 * k, -6.9, 0.9, 90)
-text("A LOW <5K", -DX - 5, 45.0, 1.0); text("B HIGH >5K", DX - 5, 45.0, 1.0)
-text("USB-C", 36.5, 44.8, 1.0)
+text("A LOW <5K", -DX - 5, 3.2, 1.0); text("B HIGH >5K", DX - 5, 3.2, 1.0)
+text("USB-C >", 32.0, 55.2, 0.8)
+for k, nm in enumerate(["D6", "D5", "D4", "D3", "D2", "D1", "D0"]):          # XIAO pin names, top row
+    text(nm, XCX - 7.62 + 2.54 * k, 44.2, 0.8, 90)
+for k, nm in enumerate(["D7", "D8", "D9", "D10", "3V3", "GND", "5V"]):        # bottom row
+    text(nm, XCX - 7.62 + 2.54 * k, 65.4, 0.8, 90)
 text("LED: 5V GND DIN", -32.0, 54.0, 0.8)
 text("NO COPPER", 22.2, 55.0, 0.8, 90)
 # display module outlines (36 x 44 mm, header centre 21.5 mm below the screen centre) and 32.4 mm glass
