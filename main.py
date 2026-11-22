@@ -3,7 +3,7 @@
 # Display : 240x240 SPI TFT (GC9A01 round is ideal, ST7789 square also works)
 # Driver  : any pure-Python driver with blit_buffer(buf, x, y, w, h), e.g.
 #           russhughes/gc9a01py or russhughes/st7789py_mpy (copy the .py to the board)
-# Data    : airplanes.live public API (no key; keep to <= 1 request/second)
+# Data    : adsb.lol public API (no key; keep to <= 1 request/second)
 #
 # How it works: everything is drawn into ONE RGB565 framebuffer in RAM using the
 # built-in (C-speed) framebuf module, then the whole frame is pushed to the
@@ -33,7 +33,8 @@ FETCH_S     = 8                # seconds between API calls
 SWEEP_S     = 4.0              # seconds per full beam rotation
 TRAIL_DEG   = 60               # length of the fading afterglow behind the beam
 TRAIL_STEPS = 15               # number of wedges the afterglow is built from
-API_URL     = "https://api.airplanes.live/v2/point/{:.4f}/{:.4f}/{}"
+# airplanes.live now returns 403 unless you email them; adsb.lol serves the same JSON format.
+API_URL     = "https://api.adsb.lol/v2/point/{:.4f}/{:.4f}/{}"
 
 # LED proximity bar (WS2812 / NeoPixel strip)
 LED_PIN        = PINS["led"]   # data-in of the strip
@@ -43,14 +44,32 @@ MIN_CLOSING_KT = 30            # must be closing at least this fast to count as 
 LED_BRIGHT     = 40            # 0-255; keep low (10 LEDs at full white draw ~600 mA)
 LED_SPEED      = 25            # bar animation speed, LEDs per second
 
+MISO_PIN = 23                  # unused dummy pin for the SPI bus (D5 on the XIAO)
 W, H   = 240, 240
 CX, CY = W // 2, H // 2
 R      = min(W, H) // 2 - 2
 
 # ------------------------------------------------------------------ framebuffer
-# Allocate first, before Wi-Fi/TLS/JSON fragment the heap (needs 115 KB contiguous).
-buf = bytearray(W * H * 2)
-fb  = framebuf.FrameBuffer(buf, W, H, framebuf.RGB565)
+# A full 240x240 RGB565 frame is 115 KB, too much next to Wi-Fi/TLS/threads on the C6
+# (the MicroPython heap shares RAM with the Wi-Fi stack). So each frame is drawn and pushed
+# in horizontal strips of STRIP_H rows that share one small buffer (28.8 KB for 60 rows).
+STRIP_H = 60                   # must divide H evenly
+buf  = bytearray(W * STRIP_H * 2)
+_fb  = framebuf.FrameBuffer(buf, W, STRIP_H, framebuf.RGB565)
+
+class View:
+    """Drawing calls take full-screen coordinates; y0 selects the strip being drawn."""
+    y0 = 0
+    def fill(self, c): _fb.fill(c)
+    def line(self, x1, y1, x2, y2, c): _fb.line(x1, y1 - self.y0, x2, y2 - self.y0, c)
+    def ellipse(self, x, y, rx, ry, c): _fb.ellipse(x, y - self.y0, rx, ry, c)
+    def hline(self, x, y, w, c): _fb.hline(x, y - self.y0, w, c)
+    def vline(self, x, y, h, c): _fb.vline(x, y - self.y0, h, c)
+    def text(self, s, x, y, c): _fb.text(s, x, y - self.y0, c)
+    def fill_rect(self, x, y, w, h, c): _fb.fill_rect(x, y - self.y0, w, h, c)
+    def poly(self, x, y, coords, c, f=True): _fb.poly(x, y - self.y0, coords, c, f)
+
+fb = View()
 
 # ------------------------------------------------------------------ display
 # Pins come from PINS above (see the wiring SVGs). The C6 can route SPI to any GPIO;
@@ -58,7 +77,8 @@ fb  = framebuf.FrameBuffer(buf, W, H, framebuf.RGB565)
 # XIAO those pins aren't on the headers, so if 60-80 MHz gives garbage, drop back to 40.
 # GC9A01 uses SPI mode 0; many CS-less ST7789 modules need polarity=1, phase=1.
 spi = SPI(1, baudrate=40_000_000, polarity=0, phase=0,
-          sck=Pin(PINS["sck"]), mosi=Pin(PINS["mosi"]))
+          sck=Pin(PINS["sck"]), mosi=Pin(PINS["mosi"]),
+          miso=Pin(MISO_PIN))   # unused, but must NOT default to GPIO2 (the XIAO's CS pin)
 
 import gc9a01py as drv         # use the driver file's actual module name
 tft = drv.GC9A01(spi, dc=Pin(PINS["dc"], Pin.OUT), cs=Pin(PINS["cs"], Pin.OUT),
@@ -137,13 +157,16 @@ def draw_grid():
     fb.text("%dNM" % RANGE_NM, CX + 4, CY + R - 14, TEXT)
 
 # ------------------------------------------------------------------ aircraft data
-# Each entry: (east_nm, north_nm, v_east, v_north [nm per ms], t_ms, label)
+# Each entry: (east_nm, north_nm, v_east, v_north [nm per ms], t_ms, label, info)
+# label = callsign, info = "TYPE KT" (aircraft type and ground speed in knots)
 planes = []
 
 def fetch_once():
     r = requests.get(API_URL.format(HOME_LAT, HOME_LON, RANGE_NM),
                      headers={"User-Agent": "esp32c6-radar"})
     try:
+        if r.status_code != 200:
+            raise OSError("HTTP %d" % r.status_code)
         data = r.json()
     finally:
         r.close()
@@ -167,7 +190,9 @@ def fetch_once():
         v = (ac.get("gs") or 0) / 3_600_000 # knots -> nm per ms
         trk = (ac.get("track") or 0) * D2R
         label = (ac.get("flight") or ac.get("hex") or "").strip()
-        out.append((e, n, v * math.sin(trk), v * math.cos(trk), now, label))
+        gs = ac.get("gs")
+        info = "%s %d" % (ac.get("t") or "?", gs) if gs is not None else (ac.get("t") or "")
+        out.append((e, n, v * math.sin(trk), v * math.cos(trk), now, label, info))
     return out
 
 def fetch_loop():
@@ -183,8 +208,10 @@ def fetch_loop():
 SCALE = R / RANGE_NM
 RMAX2 = RANGE_NM * RANGE_NM
 
-def draw_planes(angle, now):
-    for e0, n0, ve, vn, t0, label in planes:
+def project_planes(angle, now):
+    """Screen position, colour and label of every plane (computed once per frame)."""
+    out = []
+    for e0, n0, ve, vn, t0, label, info in planes:
         dt = time.ticks_diff(now, t0)
         e = e0 + ve * dt                    # dead-reckon between API updates
         n = n0 + vn * dt
@@ -195,9 +222,21 @@ def draw_planes(angle, now):
         c = BLIP[int((1 - lag / 360) * (LEVELS - 1))]
         x = CX + int(e * SCALE)
         y = CY - int(n * SCALE)
+        out.append((x, y, c, label if lag < 180 else None, info))   # text only while "glowing"
+    return out
+
+def draw_planes(pl):
+    lo = fb.y0
+    hi = lo + STRIP_H
+    for x, y, c, label, info in pl:
+        if y + 14 < lo or y - 4 >= hi:      # not in this strip
+            continue
         fb.fill_rect(x - 1, y - 1, 3, 3, c)
-        if lag < 180:                       # label only while still "glowing"
-            fb.text(label, x + 4, y - 3, c)
+        if label:                           # two lines: callsign, then "TYPE KT"
+            w = 8 * max(len(label), len(info))
+            tx = x + 4 if x + 4 + w <= W - 12 else x - 4 - w   # flip left near the edge
+            fb.text(label, tx, y - 3, c)
+            fb.text(info, tx, y + 6, c)
 
 # ------------------------------------------------------------------ LED proximity bar
 KT_PER_NM_MS = 3_600_000          # (nm per ms) -> knots
@@ -206,7 +245,7 @@ def nearest_inbound(now):
     """Distance (nm) of the closest aircraft inside LED_RANGE_NM that is closing
     on home, or None if there isn't one."""
     best = None
-    for e0, n0, ve, vn, t0, label in planes:
+    for e0, n0, ve, vn, t0, label, info in planes:
         dt = time.ticks_diff(now, t0)
         e = e0 + ve * dt
         n = n0 + vn * dt
@@ -262,9 +301,11 @@ def main():
     global led_goal
     np.fill((0, 0, 0))
     np.write()
-    fb.fill(BLACK)
-    fb.text("connecting...", CX - 52, CY - 4, TEXT)
-    tft.blit_buffer(buf, 0, 0, W, H)
+    for y0 in range(0, H, STRIP_H):
+        fb.y0 = y0
+        fb.fill(BLACK)
+        fb.text("connecting...", CX - 52, CY - 4, TEXT)
+        tft.blit_buffer(buf, 0, y0, W, STRIP_H)
     wifi()
 
     _thread.stack_size(16 * 1024)           # TLS + JSON need a bigger stack
@@ -286,14 +327,16 @@ def main():
             led_goal = led_target(nearest_inbound(now))
         led_update(dt)
 
-        fb.fill(BLACK)
-        draw_trail(a)                       # 1. afterglow wedges
-        draw_grid()                         # 2. rings on top of the glow
-        fb.line(CX, CY, CX + EX[a], CY + EY[a], BEAM)   # 3. the beam itself
-        draw_planes(angle, now)             # 4. blips with decay
-        fb.fill_rect(CX - 1, CY - 1, 3, 3, BEAM)        # home marker
-
-        tft.blit_buffer(buf, 0, 0, W, H)    # one SPI burst per frame
+        pl = project_planes(angle, now)     # once per frame, shared by all strips
+        for y0 in range(0, H, STRIP_H):
+            fb.y0 = y0
+            fb.fill(BLACK)
+            draw_trail(a)                   # 1. afterglow wedges
+            draw_grid()                     # 2. rings on top of the glow
+            fb.line(CX, CY, CX + EX[a], CY + EY[a], BEAM)   # 3. the beam itself
+            draw_planes(pl)                 # 4. blips with decay
+            fb.fill_rect(CX - 1, CY - 1, 3, 3, BEAM)        # home marker
+            tft.blit_buffer(buf, 0, y0, W, STRIP_H)         # one SPI burst per strip
         time.sleep_ms(1)                    # let the fetch thread get the GIL
 
 main()

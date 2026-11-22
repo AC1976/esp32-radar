@@ -1,7 +1,7 @@
 # esp32-radar
 
 A sweeping, radar-style display of nearby aircraft on an ESP32-C6 running MicroPython.
-Live ADS-B positions come from the public [airplanes.live](https://airplanes.live) API and are
+Live ADS-B positions come from the public [adsb.lol](https://api.adsb.lol) API (no key needed) and are
 drawn as fading "phosphor" blips under a rotating beam.
 
 ## Hardware
@@ -62,8 +62,9 @@ A 330 ohm resistor in the data line and a common ground are recommended.
 
 ## How it works
 
-Every frame is drawn into a single 115 KB RGB565 framebuffer with MicroPython's built-in
-`framebuf` module and pushed to the display in one SPI transfer. The afterglow is a fan of
+Every frame is drawn with MicroPython's built-in `framebuf` module into a small RGB565 buffer,
+one horizontal strip at a time (`STRIP_H` rows), and each strip is pushed to the display in one
+SPI transfer. The afterglow is a fan of
 filled triangles in decreasing brightness; each aircraft's brightness depends on how many
 degrees ago the beam passed its bearing. A background thread polls the API every few seconds,
 and positions are dead-reckoned from ground speed and track between updates.
@@ -71,3 +72,12 @@ and positions are dead-reckoned from ground speed and track between updates.
 ## Notes
 
 - Respect the API rate limit (max ~1 request/second).
+- **Data source.** `api.airplanes.live` now returns HTTP 403 unless you contact them by email first,
+  so `API_URL` points at adsb.lol, which serves the same JSON format. Change `API_URL` to switch.
+- **Memory.** A full 240x240 RGB565 frame (115 KB) leaves too little RAM for Wi-Fi, TLS and the
+  fetch thread on the C6, so `main.py` draws and sends the frame in strips that share one small
+  buffer (28.8 KB). `STRIP_H` must divide 240 evenly.
+- **SPI MISO pin.** The display never sends data back, but if no `miso` is given MicroPython uses the
+  C6 default (GPIO 2), which is the display CS pin on the XIAO map, and the screen stays dark.
+  `main.py` therefore passes a dummy `MISO_PIN` (GPIO 23).
+- **Labels.** Each blip shows the callsign and, beneath it, the aircraft type and ground speed in knots.
