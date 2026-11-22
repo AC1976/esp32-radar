@@ -21,8 +21,8 @@ from secrets import WIFI_SSID, WIFI_PASS   # secrets.py lives on the board, not 
 BOARD = "XIAO_C6"              # "XIAO_C6" (Seeed XIAO ESP32C6) or "DEVKITC" (ESP32-C6-DevKitC-1)
 PINS = {
     #             SPI clock/data    display control          LED strip
-    "XIAO_C6": dict(sck=18, mosi=20, res=22, dc=21, cs=2,  blk=1,  led=0),   # D10 D9 D4 D3 D2 D1 D0
-    "DEVKITC": dict(sck=6,  mosi=7,  res=18, dc=19, cs=20, blk=21, led=22),
+    "XIAO_C6": dict(sck=18, mosi=20, res=22, dc=21, cs=2,  blk=1,  led=0,  cs2=19),   # D10 D9 D4 D3 D2 D1 D0, D8
+    "DEVKITC": dict(sck=6,  mosi=7,  res=18, dc=19, cs=20, blk=21, led=22, cs2=23),
 }[BOARD]
 
 HOME_LAT    = 52.3086          # your position (decimal degrees); default = Schiphol airport area
@@ -33,15 +33,13 @@ except ImportError:
     pass
 RANGE_KM    = 15               # outer ring radius in kilometres
 RANGE_NM    = RANGE_KM / 1.852 # the same, in nautical miles (used internally)
-MIN_ALT_FT  = 500              # ignore aircraft on the ground or below this altitude
+MIN_ALT_FT  = 100             # ignore aircraft on the ground or below this altitude
 FETCH_S     = 18               # seconds between API calls (positions are dead-reckoned in between)
 
-# Altitude bands, shown one at a time in rotation: (label, min_ft, max_ft).
-# The display switches band each time the beam has swept BAND_SWEEPS full turns.
-BANDS = (("LOW <5K",    MIN_ALT_FT, 5000),
-         ("MID 5-25K",  5000,       25000),
-         ("HIGH >25K",  25000,      1000000))
-BAND_SWEEPS = 1                # full beam rotations per band (BAND_SWEEPS x SWEEP_S seconds)
+# Two displays share the SPI bus, DC, RES and BLK lines and have their own CS pin:
+# display A (PINS["cs"]) shows aircraft below SPLIT_FT, display B (PINS["cs2"]) the ones above.
+SPLIT_FT    = 5000
+LABELS      = ("LOW <5K", "HIGH >5K")
 SWEEP_S     = 8.0              # seconds per full beam rotation
 TRAIL_DEG   = 60               # length of the fading afterglow behind the beam
 TRAIL_STEPS = 15               # number of wedges the afterglow is built from
@@ -71,21 +69,26 @@ R      = min(W, H) // 2 - 2
 # A full 240x240 RGB565 frame is 115 KB, too much next to Wi-Fi/TLS/threads on the C6
 # (the MicroPython heap shares RAM with the Wi-Fi stack). So each frame is drawn and pushed
 # in horizontal strips of STRIP_H rows that share one small buffer (28.8 KB for 60 rows).
-STRIP_H = 60                   # must divide H evenly
+STRIP_H = 30                   # must divide H evenly (two buffers, one per display)
 buf  = bytearray(W * STRIP_H * 2)
 _fb  = framebuf.FrameBuffer(buf, W, STRIP_H, framebuf.RGB565)
 
+buf2 = bytearray(W * STRIP_H * 2)     # second strip buffer, for display B
+_fb2 = framebuf.FrameBuffer(buf2, W, STRIP_H, framebuf.RGB565)
+
 class View:
-    """Drawing calls take full-screen coordinates; y0 selects the strip being drawn."""
+    """Drawing calls take full-screen coordinates; y0 selects the strip being drawn,
+    f the strip buffer (_fb for display A, _fb2 for display B)."""
     y0 = 0
-    def fill(self, c): _fb.fill(c)
-    def line(self, x1, y1, x2, y2, c): _fb.line(x1, y1 - self.y0, x2, y2 - self.y0, c)
-    def ellipse(self, x, y, rx, ry, c): _fb.ellipse(x, y - self.y0, rx, ry, c)
-    def hline(self, x, y, w, c): _fb.hline(x, y - self.y0, w, c)
-    def vline(self, x, y, h, c): _fb.vline(x, y - self.y0, h, c)
-    def text(self, s, x, y, c): _fb.text(s, x, y - self.y0, c)
-    def fill_rect(self, x, y, w, h, c): _fb.fill_rect(x, y - self.y0, w, h, c)
-    def poly(self, x, y, coords, c, f=True): _fb.poly(x, y - self.y0, coords, c, f)
+    f = _fb
+    def fill(self, c): self.f.fill(c)
+    def line(self, x1, y1, x2, y2, c): self.f.line(x1, y1 - self.y0, x2, y2 - self.y0, c)
+    def ellipse(self, x, y, rx, ry, c): self.f.ellipse(x, y - self.y0, rx, ry, c)
+    def hline(self, x, y, w, c): self.f.hline(x, y - self.y0, w, c)
+    def vline(self, x, y, h, c): self.f.vline(x, y - self.y0, h, c)
+    def text(self, s, x, y, c): self.f.text(s, x, y - self.y0, c)
+    def fill_rect(self, x, y, w, h, c): self.f.fill_rect(x, y - self.y0, w, h, c)
+    def poly(self, x, y, coords, c, f=True): self.f.poly(x, y - self.y0, coords, c, f)
 
 fb = View()
 
@@ -99,9 +102,13 @@ spi = SPI(1, baudrate=40_000_000, polarity=0, phase=0,
           miso=Pin(MISO_PIN))   # unused, but must NOT default to GPIO2 (the XIAO's CS pin)
 
 import gc9a01py as drv         # use the driver file's actual module name
+cs2 = Pin(PINS["cs2"], Pin.OUT, value=1)       # deselect B while A is initialised (shared RES pulses both)
 tft = drv.GC9A01(spi, dc=Pin(PINS["dc"], Pin.OUT), cs=Pin(PINS["cs"], Pin.OUT),
                  reset=Pin(PINS["res"], Pin.OUT), backlight=Pin(PINS["blk"], Pin.OUT),
                  rotation=0)
+# display B: same bus/DC/RES/BLK wires, own CS; reset and backlight are already handled by A
+tft2 = drv.GC9A01(spi, dc=Pin(PINS["dc"], Pin.OUT), cs=cs2, reset=None, backlight=None,
+                  rotation=0)
 # ST7789 alternative (check your driver's README for the exact constructor):
 # import st7789py as drv
 # tft = drv.ST7789(spi, 240, 240, reset=Pin(PINS["res"], Pin.OUT), dc=Pin(PINS["dc"], Pin.OUT),
@@ -237,17 +244,15 @@ def fetch_loop():
         gc.collect()
         time.sleep(FETCH_S)
 
-band = 0                          # index into BANDS currently displayed
 SCALE = R / RANGE_NM
 RMAX2 = RANGE_NM * RANGE_NM
 
 def project_planes(angle, now):
-    """Screen position, colour and label of every plane (computed once per frame)."""
-    out = []
-    lo, hi = BANDS[band][1], BANDS[band][2]
+    """Screen position, colour and label of every plane (computed once per frame).
+    Returns (low, high): planes below / above SPLIT_FT, for display A / B."""
+    low = []
+    high = []
     for e0, n0, ve, vn, t0, label, info, alt in planes:
-        if not lo <= alt < hi:              # only the altitude band currently on show
-            continue
         dt = time.ticks_diff(now, t0)
         e = e0 + ve * dt                    # dead-reckon between API updates
         n = n0 + vn * dt
@@ -258,11 +263,12 @@ def project_planes(angle, now):
         c = BLIP[int((1 - lag / 360) * (LEVELS - 1))]
         x = CX + int(e * SCALE)
         y = CY - int(n * SCALE)
-        out.append((x, y, c, label if lag < LABEL_DEG else None, info))   # text only for LABEL_DEG after the beam
-    return out
+        (low if alt < SPLIT_FT else high).append(
+            (x, y, c, label if lag < LABEL_DEG else None, info))   # text only for LABEL_DEG after the beam
+    return low, high
 
-def draw_band():
-    txt = BANDS[band][0]
+def draw_band(i):
+    txt = LABELS[i]
     fb.text(txt, CX - 4 * len(txt), CY - R + 16, TEXT)
 
 def draw_planes(pl):
@@ -347,7 +353,7 @@ def wifi():
     print("wifi:", sta.isconnected(), sta.ifconfig())
 
 def main():
-    global led_goal, band
+    global led_goal
     np.fill((0, 0, 0))
     np.write()
     for y0 in range(0, H, STRIP_H):
@@ -355,6 +361,7 @@ def main():
         fb.fill(BLACK)
         fb.text("connecting...", CX - 52, CY - 4, TEXT)
         tft.blit_buffer(buf, 0, y0, W, STRIP_H)
+        tft2.blit_buffer(buf, 0, y0, W, STRIP_H)
     wifi()
 
     _thread.stack_size(16 * 1024)           # TLS + JSON need a bigger stack
@@ -362,7 +369,6 @@ def main():
 
     deg_per_ms = 360 / (SWEEP_S * 1000)
     angle = 0.0
-    sweeps = 0
     last = time.ticks_ms()
     while True:
         now = time.ticks_ms()
@@ -374,23 +380,26 @@ def main():
         a = int(angle)
 
         if angle < prev:                    # beam just passed north: once per sweep
-            sweeps += 1
-            if sweeps % BAND_SWEEPS == 0:
-                band = (band + 1) % len(BANDS)
             led_goal = led_target(nearest_inbound(now))   # LED bar looks at every flight level
         led_update(dt)
 
-        pl = project_planes(angle, now)     # once per frame, shared by all strips
+        low, high = project_planes(angle, now)   # once per frame, shared by all strips
         for y0 in range(0, H, STRIP_H):
             fb.y0 = y0
+            fb.f = _fb
             fb.fill(BLACK)
             draw_trail(a)                   # 1. afterglow wedges
             draw_grid()                     # 2. rings on top of the glow
-            draw_band()                     #    and the altitude-band label
             fb.line(CX, CY, CX + EX[a], CY + EY[a], BEAM)   # 3. the beam itself
-            draw_planes(pl)                 # 4. blips with decay
             fb.fill_rect(CX - 1, CY - 1, 3, 3, BEAM)        # home marker
-            tft.blit_buffer(buf, 0, y0, W, STRIP_H)         # one SPI burst per strip
+            _fb2.blit(_fb, 0, 0)            # same base layer for display B
+            draw_band(0)                    # 4. each display: band label + its blips
+            draw_planes(low)
+            tft.blit_buffer(buf, 0, y0, W, STRIP_H)         # one SPI burst per strip and display
+            fb.f = _fb2
+            draw_band(1)
+            draw_planes(high)
+            tft2.blit_buffer(buf2, 0, y0, W, STRIP_H)
         time.sleep_ms(1)                    # let the fetch thread get the GIL
 
 main()

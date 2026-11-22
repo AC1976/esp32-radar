@@ -8,6 +8,7 @@ drawn as fading "phosphor" blips under a rotating beam.
 
 - ESP32-C6 board
 - 240x240 SPI TFT: GC9A01 (round, recommended) or ST7789 (square)
+- Optional second display (same type): low aircraft on one screen, high on the other
 - Optional: 10-LED WS2812 (NeoPixel) strip as an inbound-traffic proximity bar
 
 ## Wiring
@@ -24,8 +25,12 @@ Set `BOARD` at the top of `main.py` to match your board; the pin map follows aut
 | Display DC | D3 · GPIO 21 | GPIO 19 |
 | Display CS | D2 · GPIO 2 | GPIO 20 |
 | Display BLK | D1 · GPIO 1 | GPIO 21 |
+| Display 2 CS (all other pins shared with display 1) | D8 · GPIO 19 | GPIO 23 |
 | Strip 5V / GND | 5V / GND | 5V / GND |
 | Strip DIN (via 330 ohm) | D0 · GPIO 0 | GPIO 22 |
+
+Display 2 shares SCL, SDA, DC, RES, BLK, VCC and GND with display 1 and only needs its own CS wire.
+Without a second display, remove the `tft2` lines in `main.py`.
 
 Diagrams: [`esp32-radar-wiring-xiao.svg`](esp32-radar-wiring-xiao.svg) and
 [`esp32-radar-wiring.svg`](esp32-radar-wiring.svg) (DevKitC).
@@ -84,9 +89,12 @@ and positions are dead-reckoned from ground speed and track between updates.
 - **SPI MISO pin.** The display never sends data back, but if no `miso` is given MicroPython uses the
   C6 default (GPIO 2), which is the display CS pin on the XIAO map, and the screen stays dark.
   `main.py` therefore passes a dummy `MISO_PIN` (GPIO 23).
-- **Altitude bands.** The radar shows one band at a time (`BANDS`: 500-5000 ft, 5000-25000 ft, above
-  25000 ft), switching every `BAND_SWEEPS` sweeps, with the band named near the top of the screen.
-  With the slow `FETCH_S` of 18 s, positions are dead-reckoned between API calls.
+- **Two displays.** Display A (CS D2) shows aircraft from `MIN_ALT_FT` (100 ft) to `SPLIT_FT` (5000 ft),
+  display B (CS D8) everything above. The base layer (afterglow, grid, beam) is drawn once per strip and
+  copied to the second buffer. Only display A gets the `reset` pin: the RES line is shared, and B's CS is
+  held high while A initialises. With two 30-row strip buffers (`STRIP_H = 30`) memory matches the
+  single-display build; two 60-row buffers ran out of memory (`ENOMEM` in the fetch thread).
+  Positions are dead-reckoned between API calls (`FETCH_S` = 18 s).
 - **Labels.** Each blip shows the airline ICAO code from the callsign and the aircraft type, with ground
   speed and flight level beneath (e.g. `KLM A21N` / `250 FL065`). They stay visible for `LABEL_DEG`
   degrees after the beam passes. `KLC` is KLM Cityhopper.
