@@ -35,13 +35,16 @@ XIAO notes: it ships without headers (solder them first); its 5V pin only carrie
 
 ## LED proximity bar
 
-Once per sweep (as the beam passes north) the strip shows the closest aircraft that is within
-`LED_RANGE_NM` (default 20 nm) **and** closing on your position at `MIN_CLOSING_KT` or more.
-Each LED is 2 nm: one LED lights at 18-20 nm, all ten inside 2 nm; the bar animates up or
-down to its new height and goes dark when nothing qualifies.
+Once per sweep (as the beam passes north) the strip shows the closest aircraft, at any flight
+level, that is inside the radar range (`RANGE_KM`), inside `LED_SECTOR` (default: bearing 0-90 deg,
+the north-east quarter, drawn as two dim cyan lines on the radar) **and** closing on your position at
+`MIN_CLOSING_KT` or more. The bar spans the radar range (10 LEDs = 1.5 km each at 15 km): one LED at
+the outer edge, all ten overhead. It animates up or down and goes dark when nothing qualifies.
+Colours run green (far), yellow, orange, red (overhead); brightness scales from `LED_BRIGHT_MIN`
+with one LED to `LED_BRIGHT` with all ten lit.
 
-Wiring: strip 5V to the board's 5V/VBUS pin (not 3V3), GND to GND, DIN to `LED_PIN` (GPIO 22).
-A 330 ohm resistor in the data line and a common ground are recommended.
+Wiring: strip 5V to the board's 5V/VBUS pin (not 3V3), GND to GND, DIN to `LED_PIN` (GPIO 0 on the
+XIAO). A 330 ohm resistor in the data line and a common ground are recommended.
 
 ## Software
 
@@ -56,8 +59,9 @@ A 330 ohm resistor in the data line and a common ground are recommended.
 2. Copy the display driver `.py` file to the board.
 3. Copy `secrets.example.py` to `secrets.py` and fill in your Wi-Fi credentials
    (`secrets.py` is git-ignored).
-4. Edit the config block at the top of `main.py`: your latitude/longitude, range, and the SPI
-   pins for your wiring.
+4. Add your position to `secrets.py` (`HOME_LAT = ...`, `HOME_LON = ...`, decimal degrees) so it
+   is not committed, and edit the config block at the top of `main.py` (range, sweep speed, altitude
+   bands, LED sector, pins).
 5. Copy both files to the board (`mpremote cp main.py secrets.py :`) and reset.
 
 ## How it works
@@ -80,4 +84,9 @@ and positions are dead-reckoned from ground speed and track between updates.
 - **SPI MISO pin.** The display never sends data back, but if no `miso` is given MicroPython uses the
   C6 default (GPIO 2), which is the display CS pin on the XIAO map, and the screen stays dark.
   `main.py` therefore passes a dummy `MISO_PIN` (GPIO 23).
-- **Labels.** Each blip shows the callsign and, beneath it, the aircraft type and ground speed in knots.
+- **Altitude bands.** The radar shows one band at a time (`BANDS`: 500-5000 ft, 5000-25000 ft, above
+  25000 ft), switching every `BAND_SWEEPS` sweeps, with the band named near the top of the screen.
+  With the slow `FETCH_S` of 18 s, positions are dead-reckoned between API calls.
+- **Labels.** Each blip shows the airline ICAO code from the callsign and the aircraft type, with ground
+  speed and flight level beneath (e.g. `KLM A21N` / `250 FL065`). They stay visible for `LABEL_DEG`
+  degrees after the beam passes. `KLC` is KLM Cityhopper.

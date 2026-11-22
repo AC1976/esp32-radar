@@ -25,23 +25,41 @@ PINS = {
     "DEVKITC": dict(sck=6,  mosi=7,  res=18, dc=19, cs=20, blk=21, led=22),
 }[BOARD]
 
-HOME_LAT    = 52.3086          # your position (decimal degrees)
+HOME_LAT    = 52.3086          # your position (decimal degrees); default = Schiphol airport area
 HOME_LON    = 4.7639
-RANGE_NM    = 25               # outer ring radius in nautical miles
+try:                           # keep your real home position private: put it in secrets.py
+    from secrets import HOME_LAT, HOME_LON
+except ImportError:
+    pass
+RANGE_KM    = 15               # outer ring radius in kilometres
+RANGE_NM    = RANGE_KM / 1.852 # the same, in nautical miles (used internally)
 MIN_ALT_FT  = 500              # ignore aircraft on the ground or below this altitude
-FETCH_S     = 8                # seconds between API calls
-SWEEP_S     = 4.0              # seconds per full beam rotation
+FETCH_S     = 18               # seconds between API calls (positions are dead-reckoned in between)
+
+# Altitude bands, shown one at a time in rotation: (label, min_ft, max_ft).
+# The display switches band each time the beam has swept BAND_SWEEPS full turns.
+BANDS = (("LOW <5K",    MIN_ALT_FT, 5000),
+         ("MID 5-25K",  5000,       25000),
+         ("HIGH >25K",  25000,      1000000))
+BAND_SWEEPS = 1                # full beam rotations per band (BAND_SWEEPS x SWEEP_S seconds)
+SWEEP_S     = 8.0              # seconds per full beam rotation
 TRAIL_DEG   = 60               # length of the fading afterglow behind the beam
 TRAIL_STEPS = 15               # number of wedges the afterglow is built from
+LABEL_DEG   = 360              # flight details stay visible this many degrees after the beam passes
+                               # (180 = half a sweep, 360 = a full sweep; they dim with the blip)
 # airplanes.live now returns 403 unless you email them; adsb.lol serves the same JSON format.
 API_URL     = "https://api.adsb.lol/v2/point/{:.4f}/{:.4f}/{}"
 
 # LED proximity bar (WS2812 / NeoPixel strip)
 LED_PIN        = PINS["led"]   # data-in of the strip
 LED_N          = 10            # number of LEDs
-LED_RANGE_NM   = 20            # bar shows inbound traffic within this distance (20/10 = 2 nm per LED)
+LED_RANGE_NM   = RANGE_NM      # bar spans the whole radar range (RANGE_KM / LED_N = 1.5 km per LED)
+LED_SECTOR     = (0, 90)       # only aircraft whose bearing from home is in this sector count:
+                               # (from_deg, to_deg) clockwise, 0 = north, 90 = east -> north-east quarter
 MIN_CLOSING_KT = 30            # must be closing at least this fast to count as "approaching"
-LED_BRIGHT     = 40            # 0-255; keep low (10 LEDs at full white draw ~600 mA)
+LED_BRIGHT     = 40            # 0-255 brightness when ALL LEDs are lit (closest aircraft)
+LED_BRIGHT_MIN = 6             # 0-255 brightness when only the first LED is lit; in between it
+                               # scales up with the number of lit LEDs
 LED_SPEED      = 25            # bar animation speed, LEDs per second
 
 MISO_PIN = 23                  # unused dummy pin for the SPI bus (D5 on the XIAO)
@@ -98,11 +116,15 @@ if BOARD == "XIAO_C6":
 # ------------------------------------------------------------------ LED strip
 import neopixel
 np = neopixel.NeoPixel(Pin(LED_PIN, Pin.OUT), LED_N)
-# Gradient along the strip: green at the "far" end -> red at the "close" end
+# Colour of each LED at full scale: green (far) -> yellow -> orange -> red (overhead)
+_STOPS = ((0, 255, 0), (255, 190, 0), (255, 70, 0), (255, 0, 0))
 LED_COL = []
 for i in range(LED_N):
-    f = i / (LED_N - 1)
-    LED_COL.append((int(LED_BRIGHT * f), int(LED_BRIGHT * (1 - f)), 0))
+    pos = i / (LED_N - 1) * (len(_STOPS) - 1)      # 0 .. 3 across the strip
+    k = min(int(pos), len(_STOPS) - 2)
+    f = pos - k
+    a, b = _STOPS[k], _STOPS[k + 1]
+    LED_COL.append(tuple(int(a[c] + (b[c] - a[c]) * f) for c in range(3)))
 
 # ------------------------------------------------------------------ colours
 def rgb(r, g, b):
@@ -113,6 +135,7 @@ def rgb(r, g, b):
 
 BLACK = 0
 GRID  = rgb(0, 70, 0)
+SECTOR = rgb(0, 90, 110)      # dim cyan edges of the LED sector
 TEXT  = rgb(0, 150, 0)
 BEAM  = rgb(170, 255, 170)
 
@@ -153,16 +176,19 @@ def draw_grid():
         fb.ellipse(CX, CY, r, r, GRID)
     fb.hline(CX - R, CY, 2 * R, GRID)
     fb.vline(CX, CY - R, 2 * R, GRID)
+    for ang in LED_SECTOR:                  # edges of the sector the LED bar listens to
+        a = int(ang) % 360
+        fb.line(CX, CY, CX + EX[a], CY + EY[a], SECTOR)
     fb.text("N", CX - 3, CY - R + 4, TEXT)
-    fb.text("%dNM" % RANGE_NM, CX + 4, CY + R - 14, TEXT)
+    fb.text("%dKM" % RANGE_KM, CX + 4, CY + R - 14, TEXT)
 
 # ------------------------------------------------------------------ aircraft data
-# Each entry: (east_nm, north_nm, v_east, v_north [nm per ms], t_ms, label, info)
-# label = callsign, info = "TYPE KT" (aircraft type and ground speed in knots)
+# Each entry: (east_nm, north_nm, v_east, v_north [nm per ms], t_ms, label, info, alt_ft)
+# label = "ICAO TYPE" (e.g. "KLM A21N"), info = "KT FLnnn" (ground speed and flight level)
 planes = []
 
 def fetch_once():
-    r = requests.get(API_URL.format(HOME_LAT, HOME_LON, RANGE_NM),
+    r = requests.get(API_URL.format(HOME_LAT, HOME_LON, int(RANGE_NM) + 1),
                      headers={"User-Agent": "esp32c6-radar"})
     try:
         if r.status_code != 200:
@@ -189,10 +215,16 @@ def fetch_once():
         n = (lat - HOME_LAT) * 60
         v = (ac.get("gs") or 0) / 3_600_000 # knots -> nm per ms
         trk = (ac.get("track") or 0) * D2R
-        label = (ac.get("flight") or ac.get("hex") or "").strip()
+        call = (ac.get("flight") or ac.get("hex") or "").strip()
+        # airline callsigns are 3 letters + digits: keep just the ICAO airline code;
+        # anything else (private flights, registrations) is shown as-is, shortened
+        if len(call) > 3 and call[:3].isalpha() and call[3].isdigit():
+            call = call[:3]
+        label = "%s %s" % (call[:6], ac.get("t") or "?")
         gs = ac.get("gs")
-        info = "%s %d" % (ac.get("t") or "?", gs) if gs is not None else (ac.get("t") or "")
-        out.append((e, n, v * math.sin(trk), v * math.cos(trk), now, label, info))
+        fl = "FL%03d" % (int(alt) // 100)
+        info = "%d %s" % (gs, fl) if gs is not None else fl
+        out.append((e, n, v * math.sin(trk), v * math.cos(trk), now, label, info, int(alt)))
     return out
 
 def fetch_loop():
@@ -205,13 +237,17 @@ def fetch_loop():
         gc.collect()
         time.sleep(FETCH_S)
 
+band = 0                          # index into BANDS currently displayed
 SCALE = R / RANGE_NM
 RMAX2 = RANGE_NM * RANGE_NM
 
 def project_planes(angle, now):
     """Screen position, colour and label of every plane (computed once per frame)."""
     out = []
-    for e0, n0, ve, vn, t0, label, info in planes:
+    lo, hi = BANDS[band][1], BANDS[band][2]
+    for e0, n0, ve, vn, t0, label, info, alt in planes:
+        if not lo <= alt < hi:              # only the altitude band currently on show
+            continue
         dt = time.ticks_diff(now, t0)
         e = e0 + ve * dt                    # dead-reckon between API updates
         n = n0 + vn * dt
@@ -222,8 +258,12 @@ def project_planes(angle, now):
         c = BLIP[int((1 - lag / 360) * (LEVELS - 1))]
         x = CX + int(e * SCALE)
         y = CY - int(n * SCALE)
-        out.append((x, y, c, label if lag < 180 else None, info))   # text only while "glowing"
+        out.append((x, y, c, label if lag < LABEL_DEG else None, info))   # text only for LABEL_DEG after the beam
     return out
+
+def draw_band():
+    txt = BANDS[band][0]
+    fb.text(txt, CX - 4 * len(txt), CY - R + 16, TEXT)
 
 def draw_planes(pl):
     lo = fb.y0
@@ -242,15 +282,18 @@ def draw_planes(pl):
 KT_PER_NM_MS = 3_600_000          # (nm per ms) -> knots
 
 def nearest_inbound(now):
-    """Distance (nm) of the closest aircraft inside LED_RANGE_NM that is closing
-    on home, or None if there isn't one."""
+    """Distance (nm) of the closest aircraft (any flight level) inside LED_RANGE_NM and
+    LED_SECTOR that is closing on home, or None if there isn't one."""
     best = None
-    for e0, n0, ve, vn, t0, label, info in planes:
+    for e0, n0, ve, vn, t0, label, info, alt in planes:
         dt = time.ticks_diff(now, t0)
         e = e0 + ve * dt
         n = n0 + vn * dt
         d = math.sqrt(e * e + n * n)
         if d > LED_RANGE_NM or d < 0.01:
+            continue
+        # bearing of the aircraft from home, must lie inside the LED sector
+        if (math.atan2(e, n) / D2R - LED_SECTOR[0]) % 360 > (LED_SECTOR[1] - LED_SECTOR[0]) % 360:
             continue
         # closing speed = -(radial velocity); positive means getting closer
         closing_kt = -(e * ve + n * vn) / d * KT_PER_NM_MS
@@ -280,8 +323,14 @@ def led_update(dt_ms):
         led_level = max(led_goal, led_level - step)
     lit = int(led_level + 0.5)
     if lit != led_shown:
+        # dim when few LEDs are lit (far away), brightest when all are (overhead)
+        br = LED_BRIGHT_MIN + (LED_BRIGHT - LED_BRIGHT_MIN) * (lit - 1) // (LED_N - 1) if lit else 0
         for i in range(LED_N):
-            np[i] = LED_COL[i] if i < lit else (0, 0, 0)
+            if i < lit:
+                r, g, b = LED_COL[i]
+                np[i] = (r * br // 255, g * br // 255, b * br // 255)
+            else:
+                np[i] = (0, 0, 0)
         np.write()
         led_shown = lit
 
@@ -298,7 +347,7 @@ def wifi():
     print("wifi:", sta.isconnected(), sta.ifconfig())
 
 def main():
-    global led_goal
+    global led_goal, band
     np.fill((0, 0, 0))
     np.write()
     for y0 in range(0, H, STRIP_H):
@@ -313,6 +362,7 @@ def main():
 
     deg_per_ms = 360 / (SWEEP_S * 1000)
     angle = 0.0
+    sweeps = 0
     last = time.ticks_ms()
     while True:
         now = time.ticks_ms()
@@ -324,7 +374,10 @@ def main():
         a = int(angle)
 
         if angle < prev:                    # beam just passed north: once per sweep
-            led_goal = led_target(nearest_inbound(now))
+            sweeps += 1
+            if sweeps % BAND_SWEEPS == 0:
+                band = (band + 1) % len(BANDS)
+            led_goal = led_target(nearest_inbound(now))   # LED bar looks at every flight level
         led_update(dt)
 
         pl = project_planes(angle, now)     # once per frame, shared by all strips
@@ -333,6 +386,7 @@ def main():
             fb.fill(BLACK)
             draw_trail(a)                   # 1. afterglow wedges
             draw_grid()                     # 2. rings on top of the glow
+            draw_band()                     #    and the altitude-band label
             fb.line(CX, CY, CX + EX[a], CY + EY[a], BEAM)   # 3. the beam itself
             draw_planes(pl)                 # 4. blips with decay
             fb.fill_rect(CX - 1, CY - 1, 3, 3, BEAM)        # home marker
