@@ -72,7 +72,7 @@ connect("R1", {1: "LED_5V", 2: "DIN"})
 place(*RES_FP, "R2", -14.0, 52.0, value="10k (pull-down)")
 connect("R2", {1: "LED_IN", 2: "GND"})
 place("TerminalBlock_Phoenix", "TerminalBlock_Phoenix_MKDS-1,5-3-5.08_1x03_P5.08mm_Horizontal", "J5",
-      -32.0, 62.0, value="LED strip: 5V GND DIN")
+      -32.0, 64.1, value="LED strip: 5V GND DIN")
 connect("J5", {1: "+5V", 2: "GND", 3: "DIN"})
 CAP_S = ("Capacitor_THT", "C_Disc_D3.0mm_W2.0mm_P2.50mm")
 CAP_M = ("Capacitor_THT", "C_Disc_D5.0mm_W2.5mm_P5.00mm")
@@ -284,7 +284,9 @@ for k, nm in enumerate(["D6", "D5", "D4", "D3", "D2", "D1", "D0"]):          # X
     text(nm, XCX - 7.62 + 2.54 * k, 44.2, 0.8, 90)
 for k, nm in enumerate(["D7", "D8", "D9", "D10", "3V3", "GND", "5V"]):        # bottom row
     text(nm, XCX - 7.62 + 2.54 * k, 65.4, 0.8, 90)
-text("LED: 5V GND DIN", -32.0, 54.0, 0.8)
+for k, nm in enumerate(["5V", "GND", "DIN"]):                     # screw labels; wires leave through the bottom edge
+    text(nm, -32.0 + 5.08 * k, 57.6, 0.9)
+text("LED STRIP", -26.9, 55.6, 0.9)
 text("NO COPPER", 22.2, 55.0, 0.8, 90)
 # display module outlines (36 x 44 mm, header centre 21.5 mm below the screen centre) and 32.4 mm glass
 for cx in (-DX, DX):
@@ -292,10 +294,18 @@ for cx in (-DX, DX):
     c = pcbnew.PCB_SHAPE(board); c.SetShape(pcbnew.SHAPE_T_CIRCLE)
     c.SetCenter(V(cx, 21.5)); c.SetEnd(V(cx + 16.2, 21.5)); c.SetLayer(pcbnew.Dwgs_User); c.SetWidth(mm(0.1))
     board.Add(c)
-t = pcbnew.PCB_TEXT(board); t.SetText("display module outline (36x44) + 32.4 glass"); t.SetPosition(V(0, 46.0))
+line(pcbnew.Dwgs_User, [(-40, 73), (10, 73)], 0.2, closed=False)       # 50 mm scale bar for 1:1 prints
+for tx in range(-40, 11, 10): line(pcbnew.Dwgs_User, [(tx, 72), (tx, 74)], 0.2, closed=False)
+text("50 mm: print at 100%, this bar must measure 50 mm", -15, 76, 1.0, layer=pcbnew.Dwgs_User)
+t = pcbnew.PCB_TEXT(board); t.SetText("display module outline (36x44) + 32.4 glass"); t.SetPosition(V(25, 79.5))
 t.SetLayer(pcbnew.Dwgs_User); t.SetTextSize(pcbnew.VECTOR2I(mm(1.2), mm(1.2))); board.Add(t)
 
-for ref in ("H1", "H2", "H3", "H4", "C1", "C2", "C4"): PARTS[ref].Reference().SetVisible(False)
+SHIFT = pcbnew.VECTOR2I(mm(53), mm(19))       # keep all coordinates positive so every plot fits the page
+for fp in board.GetFootprints(): fp.Move(SHIFT)
+for tr in board.GetTracks(): tr.Move(SHIFT)
+for z in board.Zones(): z.Move(SHIFT)
+for d in board.GetDrawings(): d.Move(SHIFT)
+for ref in ("H1", "H2", "H3", "H4", "C1", "C2", "C4", "J5"): PARTS[ref].Reference().SetVisible(False)
 zf = pcbnew.ZONE_FILLER(board); zf.Fill(board.Zones())
 zones = [z for z in board.Zones() if not z.GetIsRuleArea()]
 removed = 0
@@ -306,4 +316,8 @@ for v in STITCH:
 print("removed unconnected stitching vias:", removed)
 zf.Fill(board.Zones())
 board.Save(OUT)
+import re
+txt = open(OUT).read()                      # A5 page: small enough that printers do not shrink it to fit
+txt = re.sub(r'\(paper "[A-Za-z0-9]+"[^)]*\)', '(paper "A5")', txt, count=1)
+open(OUT, "w").write(txt)
 print("saved", OUT, "failed:", failed)
