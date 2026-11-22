@@ -31,9 +31,9 @@ try:                           # keep your real home position private: put it in
     from secrets import HOME_LAT, HOME_LON
 except ImportError:
     pass
-RANGE_KM    = 15               # outer ring radius in kilometres
+RANGE_KM    = 20               # outer ring radius in kilometres
 RANGE_NM    = RANGE_KM / 1.852 # the same, in nautical miles (used internally)
-MIN_ALT_FT  = 100             # ignore aircraft on the ground or below this altitude
+MIN_ALT_FT  = 200             # hard cut-off: ignore aircraft below this altitude
 FETCH_S     = 18               # seconds between API calls (positions are dead-reckoned in between)
 
 # Two displays share the SPI bus, DC, RES and BLK lines and have their own CS pin:
@@ -178,8 +178,8 @@ def draw_trail(a):
         wedge(hi - STEP, hi, TRAIL[i])
 
 def draw_grid():
-    for k in (1, 2, 3):
-        r = R * k // 3
+    for k in range(1, RANGE_KM // 5 + 1):     # one ring every 5 km
+        r = R * k * 5 // RANGE_KM
         fb.ellipse(CX, CY, r, r, GRID)
     fb.hline(CX - R, CY, 2 * R, GRID)
     fb.vline(CX, CY - R, 2 * R, GRID)
